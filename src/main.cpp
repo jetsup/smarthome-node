@@ -62,7 +62,7 @@ void setup() {
   // Register broadcast peer
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, gatewayMac, 6);
-  peerInfo.channel = 1;  // Must match Gateway channel
+  peerInfo.channel = 0;  // 0 = use WiFi home channel
   peerInfo.encrypt = false;
 
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
