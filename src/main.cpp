@@ -1,8 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
-
-#define LED_BUILTIN 2
+#include <Preferences.h>
+#include "Config.hpp"
 
 // Packet layout matching the Go Hub and Gateway (9 bytes total)
 struct __attribute__((__packed__)) ESPNowMessage {
@@ -13,56 +13,219 @@ struct __attribute__((__packed__)) ESPNowMessage {
   uint8_t checksum;  // XOR of all previous bytes
 };  // Total size is 9 bytes
 
-uint8_t gatewayMac[] = {
-    0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF};  // Broadcasting to reach the closest mesh link
+struct __attribute__((__packed__)) ESPNowProvisionMessage {
+  uint8_t header;
+  uint8_t msgType;
+  uint32_t deviceId;
+  char apiKey[33];
+  uint8_t checksum;
+};
+
+uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 uint32_t uniqueNodeId = 0;
-unsigned long lastExecutionTime = 0;
+Preferences prefs;
 
-// Callback triggered when the Gateway sends a command DOWN to the nodes
-void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
-  if (len == sizeof(ESPNowMessage)) {
-    ESPNowMessage command;
-    memcpy(&command, incomingData, sizeof(ESPNowMessage));
+bool provisioned = false;
+char nodeApiKey[33] = {0};
 
-    // CRITICAL CHECK: Only execute if the command is meant for everyone (0) OR
-    // specifically for this node's ID
-    if (command.deviceId == 0 || command.deviceId == uniqueNodeId) {
-      // Example Action: Control onboard LED based on value (1 = ON, 0 = OFF)
-      if (command.value == 1) {
-        digitalWrite(LED_BUILTIN, HIGH);
-      } else if (command.value == 0) {
-        digitalWrite(LED_BUILTIN, LOW);
-      }
+unsigned long lastReport = 0;
+unsigned long lastDiscovery = 0;
+unsigned long lastMeshFwd = 0;
+
+// Simple dedup for mesh forwarding: track recently seen discovery deviceIds
+#define DEDUP_SIZE 16
+uint32_t dedupIds[DEDUP_SIZE];
+unsigned long dedupTimes[DEDUP_SIZE];
+int dedupIndex = 0;
+
+bool isDuplicate(uint32_t devId) {
+  for (int i = 0; i < DEDUP_SIZE; i++) {
+    if (dedupIds[i] == devId && (millis() - dedupTimes[i] < MESH_FORWARD_INTERVAL_MS)) {
+      return true;
     }
+  }
+  dedupIds[dedupIndex] = devId;
+  dedupTimes[dedupIndex] = millis();
+  dedupIndex = (dedupIndex + 1) % DEDUP_SIZE;
+  return false;
+}
+
+uint8_t calcChecksum(const uint8_t* data, int len) {
+  uint8_t xorVal = 0;
+  for (int i = 0; i < len - 1; i++) {
+    xorVal ^= data[i];
+  }
+  return xorVal;
+}
+
+void sendESPNow(const uint8_t* data, int len) {
+  esp_now_send(broadcastMac, data, len);
+}
+
+void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
+  if (len < 2 || incomingData[0] != 0xAA) return;
+
+  uint8_t msgType = incomingData[1];
+  uint32_t devId = 0;
+
+  if (len >= 6) {
+    devId = incomingData[2] | ((uint32_t)incomingData[3] << 8) |
+            ((uint32_t)incomingData[4] << 16) | ((uint32_t)incomingData[5] << 24);
+  }
+
+  // Validate checksum
+  uint8_t calc = 0;
+  for (int i = 0; i < len - 1; i++) calc ^= incomingData[i];
+  if (calc != incomingData[len - 1]) return;
+
+  switch (msgType) {
+    case MSG_COMMAND: {
+      if (devId != 0 && devId != uniqueNodeId) break;
+      uint16_t val = 0;
+      if (len >= 8) {
+        val = incomingData[6] | ((uint16_t)incomingData[7] << 8);
+      }
+      if (val == 99) {
+        Serial.println("Factory reset via remote command");
+        prefs.remove(NVS_KEY_PROV);
+        prefs.remove(NVS_KEY_APIKEY);
+        prefs.end();
+        delay(500);
+        ESP.restart();
+      } else {
+        digitalWrite(LED_BUILTIN, val ? HIGH : LOW);
+      }
+      Serial.printf("Command: value=%u\n", val);
+      break;
+    }
+
+    case MSG_SCAN_REQ: {
+      // Respond with discovery if unprovisioned
+      if (!provisioned) {
+        ESPNowMessage resp;
+        resp.header = 0xAA;
+        resp.msgType = MSG_DISCOVERY;
+        resp.deviceId = uniqueNodeId;
+        resp.value = 0;
+        resp.checksum = calcChecksum((uint8_t*)&resp, sizeof(resp));
+        sendESPNow((uint8_t*)&resp, sizeof(resp));
+        Serial.println("Responded to scan request");
+      }
+      // Mesh forward scan request (both provisioned and unprovisioned nodes relay)
+      if (devId != uniqueNodeId && !isDuplicate(devId)) {
+        sendESPNow(incomingData, len);
+      }
+      break;
+    }
+
+    case MSG_PROVISION: {
+      // Provision command — only for us
+      if (devId != uniqueNodeId) break;
+
+      if (len >= (int)sizeof(ESPNowProvisionMessage)) {
+        ESPNowProvisionMessage provMsg;
+        memcpy(&provMsg, incomingData, sizeof(ESPNowProvisionMessage));
+
+        prefs.putBool(NVS_KEY_PROV, true);
+        prefs.putString(NVS_KEY_APIKEY, String(provMsg.apiKey));
+        prefs.end();
+
+        provisioned = true;
+        strncpy(nodeApiKey, provMsg.apiKey, sizeof(nodeApiKey) - 1);
+
+        Serial.printf("Provisioned! API key: %s\n", nodeApiKey);
+        delay(500);
+        ESP.restart();
+      } else if (len >= (int)sizeof(ESPNowMessage)) {
+        // Fallback: minimal provision signal (no API key in payload)
+        // Just mark as provisioned with a default key
+        prefs.putBool(NVS_KEY_PROV, true);
+        prefs.putString(NVS_KEY_APIKEY, "node_provisioned");
+        prefs.end();
+
+        provisioned = true;
+        strcpy(nodeApiKey, "node_provisioned");
+
+        Serial.println("Provisioned (minimal signal)");
+        delay(500);
+        ESP.restart();
+      }
+      break;
+    }
+
+    case MSG_DISCOVERY: {
+      // Mesh forwarding: if provisioned, re-broadcast discovery from other nodes
+      if (provisioned && devId != uniqueNodeId && !isDuplicate(devId)) {
+        sendESPNow(incomingData, len);
+      }
+      break;
+    }
+  }
+}
+
+void checkResetPin() {
+  static unsigned long pressStart = 0;
+  if (digitalRead(RESET_PIN) == LOW) {
+    if (pressStart == 0) {
+      pressStart = millis();
+    } else if (millis() - pressStart >= RESET_HOLD_MS) {
+      Serial.println("Factory reset via GPIO " + String(RESET_PIN));
+      prefs.remove(NVS_KEY_PROV);
+      prefs.remove(NVS_KEY_APIKEY);
+      prefs.end();
+      delay(500);
+      ESP.restart();
+    }
+  } else {
+    pressStart = 0;
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(LED_BUILTIN, OUTPUT);
+  delay(300);
 
-  // Generate a unique 32-bit ID from the ESP32's hardware MAC address
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(RESET_PIN, INPUT_PULLUP);
+
   uint64_t mac = ESP.getEfuseMac();
   uniqueNodeId = (uint32_t)(mac & 0xFFFFFFFF);
-  Serial.printf("Node Booted! Unique ID: %u\n", uniqueNodeId);
+  Serial.printf("Node boot. ID: %u\n", uniqueNodeId);
 
-  // Initialize Radio
+  // Load provisioning state from NVS
+  prefs.begin(NVS_NAMESPACE, false);
+  provisioned = prefs.getBool(NVS_KEY_PROV, false);
+  String key = prefs.getString(NVS_KEY_APIKEY, "");
+  if (key.length() > 0) {
+    strncpy(nodeApiKey, key.c_str(), sizeof(nodeApiKey) - 1);
+  }
+
+  if (provisioned) {
+    Serial.println("State: PROVISIONED");
+  } else {
+    Serial.println("State: UNPROVISIONED — broadcasting discovery");
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(200);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(200);
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(200);
+    digitalWrite(LED_BUILTIN, LOW);
+  }
+
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
+    Serial.println("ESP-NOW init failed");
     return;
   }
 
-  // Register receive handler
   esp_now_register_recv_cb(esp_now_recv_cb_t(onDataRecv));
 
-  // Register broadcast peer
   esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, gatewayMac, 6);
-  peerInfo.channel = 0;  // 0 = use WiFi home channel
+  memcpy(peerInfo.peer_addr, broadcastMac, 6);
+  peerInfo.channel = ESPNOW_CHANNEL;
   peerInfo.encrypt = false;
 
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
@@ -72,27 +235,35 @@ void setup() {
 }
 
 void loop() {
-  // Non-blocking timer: Send an update or telemetry status upwards every 100ms
-  if (millis() - lastExecutionTime > 100) {
-    lastExecutionTime = millis();
+  checkResetPin();
+  unsigned long now = millis();
 
-    ESPNowMessage statusMsg;
-    statusMsg.header = 0xAA;
-    statusMsg.msgType = 1;
-    statusMsg.deviceId = uniqueNodeId;  // Pass our unique identity
-    statusMsg.value = analogRead(34);   // Send a random sensor reading or state
+  if (provisioned) {
+    if (now - lastReport > REPORT_INTERVAL_MS) {
+      lastReport = now;
 
-    // Calculate XOR Checksum over the first 8 bytes
-    uint8_t* ptr = (uint8_t*)&statusMsg;
-    uint8_t calcXor = 0;
-    for (int i = 0; i < 8; i++) {
-      calcXor ^= ptr[i];
+      ESPNowMessage msg;
+      msg.header = 0xAA;
+      msg.msgType = MSG_TELEMETRY;
+      msg.deviceId = uniqueNodeId;
+      msg.value = analogRead(34);
+      msg.checksum = calcChecksum((uint8_t*)&msg, sizeof(msg));
+
+      sendESPNow((uint8_t*)&msg, sizeof(msg));
     }
-    statusMsg.checksum = calcXor;
+  } else {
+    if (now - lastDiscovery > DISCOVERY_INTERVAL_MS) {
+      lastDiscovery = now;
 
-    // Push packet into the airwaves
-    esp_now_send(gatewayMac, (uint8_t*)&statusMsg, sizeof(ESPNowMessage));
-    Serial.printf("Status broadcasted from ID: %u Data: %u\n", uniqueNodeId,
-                  statusMsg.value);
+      ESPNowMessage msg;
+      msg.header = 0xAA;
+      msg.msgType = MSG_DISCOVERY;
+      msg.deviceId = uniqueNodeId;
+      msg.value = 0;
+      msg.checksum = calcChecksum((uint8_t*)&msg, sizeof(msg));
+
+      sendESPNow((uint8_t*)&msg, sizeof(msg));
+      Serial.printf("Discovery broadcast: ID %u\n", uniqueNodeId);
+    }
   }
 }
