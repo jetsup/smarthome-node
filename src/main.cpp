@@ -63,7 +63,10 @@ void sendESPNow(const uint8_t* data, int len) {
 }
 
 void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
-  if (len < 2 || incomingData[0] != 0xAA) return;
+  if (len < 2 || incomingData[0] != 0xAA) {
+    Serial.printf("ESPNOW RX: bad header 0x%02X len=%d\n", incomingData[0], len);
+    return;
+  }
 
   uint8_t msgType = incomingData[1];
   uint32_t devId = 0;
@@ -76,7 +79,13 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
   // Validate checksum
   uint8_t calc = 0;
   for (int i = 0; i < len - 1; i++) calc ^= incomingData[i];
-  if (calc != incomingData[len - 1]) return;
+  if (calc != incomingData[len - 1]) {
+    Serial.printf("ESPNOW RX: checksum mismatch type=%d dev=%u len=%d\n", msgType, devId, len);
+    return;
+  }
+
+  Serial.printf("ESPNOW RX: type=%d dev=%u len=%d (myId=%u provisioned=%d)\n",
+    msgType, devId, len, uniqueNodeId, provisioned);
 
   switch (msgType) {
     case MSG_COMMAND: {
@@ -85,8 +94,9 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
       if (len >= 8) {
         val = incomingData[6] | ((uint16_t)incomingData[7] << 8);
       }
+      Serial.printf("CMD: value=%u (target=%u me=%u)\n", val, devId, uniqueNodeId);
       if (val == 99) {
-        Serial.println("Factory reset via remote command");
+        Serial.println("CMD: Factory reset via remote command (value=99)");
         prefs.remove(NVS_KEY_PROV);
         prefs.remove(NVS_KEY_APIKEY);
         prefs.end();
@@ -95,12 +105,11 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
       } else {
         digitalWrite(LED_BUILTIN, val ? HIGH : LOW);
       }
-      Serial.printf("Command: value=%u\n", val);
       break;
     }
 
     case MSG_SCAN_REQ: {
-      // Respond with discovery if unprovisioned
+      Serial.printf("SCAN_REQ: from device %u (provisioned=%d)\n", devId, provisioned);
       if (!provisioned) {
         ESPNowMessage resp;
         resp.header = 0xAA;
@@ -109,22 +118,27 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
         resp.value = 0;
         resp.checksum = calcChecksum((uint8_t*)&resp, sizeof(resp));
         sendESPNow((uint8_t*)&resp, sizeof(resp));
-        Serial.println("Responded to scan request");
+        Serial.printf("SCAN_REQ: sent discovery response (myId=%u)\n", uniqueNodeId);
       }
-      // Mesh forward scan request (both provisioned and unprovisioned nodes relay)
       if (devId != uniqueNodeId && !isDuplicate(devId)) {
+        Serial.printf("SCAN_REQ: mesh-forwarding\n");
         sendESPNow(incomingData, len);
       }
       break;
     }
 
     case MSG_PROVISION: {
-      // Provision command — only for us
-      if (devId != uniqueNodeId) break;
+      Serial.printf("PROVISION: target=%u me=%u len=%d\n", devId, uniqueNodeId, len);
+      if (devId != uniqueNodeId) {
+        Serial.printf("PROVISION: not for me (target=%u)\n", devId);
+        break;
+      }
 
       if (len >= (int)sizeof(ESPNowProvisionMessage)) {
         ESPNowProvisionMessage provMsg;
         memcpy(&provMsg, incomingData, sizeof(ESPNowProvisionMessage));
+
+        Serial.printf("PROVISION: full message received, key starts with: %.10s\n", provMsg.apiKey);
 
         prefs.putBool(NVS_KEY_PROV, true);
         prefs.putString(NVS_KEY_APIKEY, String(provMsg.apiKey));
@@ -133,12 +147,12 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
         provisioned = true;
         strncpy(nodeApiKey, provMsg.apiKey, sizeof(nodeApiKey) - 1);
 
-        Serial.printf("Provisioned! API key: %s\n", nodeApiKey);
+        Serial.printf("PROVISION: saved to NVS, API key: %s\n", nodeApiKey);
+        Serial.println("PROVISION: rebooting in 500ms");
         delay(500);
         ESP.restart();
       } else if (len >= (int)sizeof(ESPNowMessage)) {
-        // Fallback: minimal provision signal (no API key in payload)
-        // Just mark as provisioned with a default key
+        Serial.println("PROVISION: minimal signal (no API key)");
         prefs.putBool(NVS_KEY_PROV, true);
         prefs.putString(NVS_KEY_APIKEY, "node_provisioned");
         prefs.end();
@@ -146,20 +160,26 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
         provisioned = true;
         strcpy(nodeApiKey, "node_provisioned");
 
-        Serial.println("Provisioned (minimal signal)");
+        Serial.println("PROVISION: provisioned with default key, rebooting");
         delay(500);
         ESP.restart();
+      } else {
+        Serial.printf("PROVISION: packet too short (%d bytes)\n", len);
       }
       break;
     }
 
     case MSG_DISCOVERY: {
-      // Mesh forwarding: if provisioned, re-broadcast discovery from other nodes
       if (provisioned && devId != uniqueNodeId && !isDuplicate(devId)) {
+        Serial.printf("DISCOVERY: mesh-forwarding device %u\n", devId);
         sendESPNow(incomingData, len);
       }
       break;
     }
+
+    default:
+      Serial.printf("Unknown msgType=%d from device %u\n", msgType, devId);
+      break;
   }
 }
 
