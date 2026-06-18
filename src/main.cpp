@@ -4,20 +4,20 @@
 #include <Preferences.h>
 #include "Config.hpp"
 
-// Packet layout matching the Go Hub and Gateway (9 bytes total)
 struct __attribute__((__packed__)) ESPNowMessage {
-  uint8_t header;   // 0xAA
-  uint8_t msgType;  // 1
+  uint8_t header;
+  uint8_t msgType;
   uint32_t deviceId;
   uint16_t value;
-  uint8_t checksum;  // XOR of all previous bytes
-};  // Total size is 9 bytes
+  uint8_t checksum;
+};
 
 struct __attribute__((__packed__)) ESPNowProvisionMessage {
   uint8_t header;
   uint8_t msgType;
   uint32_t deviceId;
   char apiKey[33];
+  char gatewayId[17];
   uint8_t checksum;
 };
 
@@ -27,12 +27,12 @@ Preferences prefs;
 
 bool provisioned = false;
 char nodeApiKey[33] = {0};
+char nodeGatewayId[17] = {0};
 
 unsigned long lastReport = 0;
 unsigned long lastDiscovery = 0;
 unsigned long lastMeshFwd = 0;
 
-// Simple dedup for mesh forwarding: track recently seen discovery deviceIds
 #define DEDUP_SIZE 16
 uint32_t dedupIds[DEDUP_SIZE];
 unsigned long dedupTimes[DEDUP_SIZE];
@@ -76,7 +76,6 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
             ((uint32_t)incomingData[4] << 16) | ((uint32_t)incomingData[5] << 24);
   }
 
-  // Validate checksum
   uint8_t calc = 0;
   for (int i = 0; i < len - 1; i++) calc ^= incomingData[i];
   if (calc != incomingData[len - 1]) {
@@ -99,6 +98,7 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
         Serial.println("CMD: Factory reset via remote command (value=99)");
         prefs.remove(NVS_KEY_PROV);
         prefs.remove(NVS_KEY_APIKEY);
+        prefs.remove(NVS_KEY_GATEWAY);
         prefs.end();
         delay(500);
         ESP.restart();
@@ -115,10 +115,10 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
         resp.header = 0xAA;
         resp.msgType = MSG_DISCOVERY;
         resp.deviceId = uniqueNodeId;
-        resp.value = 0;
+        resp.value = DEVICE_TYPE; // carry device type in value field
         resp.checksum = calcChecksum((uint8_t*)&resp, sizeof(resp));
         sendESPNow((uint8_t*)&resp, sizeof(resp));
-        Serial.printf("SCAN_REQ: sent discovery response (myId=%u)\n", uniqueNodeId);
+        Serial.printf("SCAN_REQ: sent discovery response (myId=%u type=%d)\n", uniqueNodeId, DEVICE_TYPE);
       }
       if (devId != uniqueNodeId && !isDuplicate(devId)) {
         Serial.printf("SCAN_REQ: mesh-forwarding\n");
@@ -138,29 +138,34 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
         ESPNowProvisionMessage provMsg;
         memcpy(&provMsg, incomingData, sizeof(ESPNowProvisionMessage));
 
-        Serial.printf("PROVISION: full message received, key starts with: %.10s\n", provMsg.apiKey);
+        Serial.printf("PROVISION: full message, key starts: %.10s, gateway: %.16s\n",
+          provMsg.apiKey, provMsg.gatewayId);
 
         prefs.putBool(NVS_KEY_PROV, true);
         prefs.putString(NVS_KEY_APIKEY, String(provMsg.apiKey));
+        prefs.putString(NVS_KEY_GATEWAY, String(provMsg.gatewayId));
         prefs.end();
 
         provisioned = true;
         strncpy(nodeApiKey, provMsg.apiKey, sizeof(nodeApiKey) - 1);
+        strncpy(nodeGatewayId, provMsg.gatewayId, sizeof(nodeGatewayId) - 1);
 
-        Serial.printf("PROVISION: saved to NVS, API key: %s\n", nodeApiKey);
+        Serial.printf("PROVISION: saved — API key: %s, gateway: %s\n", nodeApiKey, nodeGatewayId);
         Serial.println("PROVISION: rebooting in 500ms");
         delay(500);
         ESP.restart();
       } else if (len >= (int)sizeof(ESPNowMessage)) {
-        Serial.println("PROVISION: minimal signal (no API key)");
+        Serial.println("PROVISION: minimal signal (no full data)");
         prefs.putBool(NVS_KEY_PROV, true);
         prefs.putString(NVS_KEY_APIKEY, "node_provisioned");
+        prefs.putString(NVS_KEY_GATEWAY, "unknown");
         prefs.end();
 
         provisioned = true;
         strcpy(nodeApiKey, "node_provisioned");
+        strcpy(nodeGatewayId, "unknown");
 
-        Serial.println("PROVISION: provisioned with default key, rebooting");
+        Serial.println("PROVISION: provisioned with defaults, rebooting");
         delay(500);
         ESP.restart();
       } else {
@@ -192,6 +197,7 @@ void checkResetPin() {
       Serial.println("Factory reset via GPIO " + String(RESET_PIN));
       prefs.remove(NVS_KEY_PROV);
       prefs.remove(NVS_KEY_APIKEY);
+      prefs.remove(NVS_KEY_GATEWAY);
       prefs.end();
       delay(500);
       ESP.restart();
@@ -210,18 +216,21 @@ void setup() {
 
   uint64_t mac = ESP.getEfuseMac();
   uniqueNodeId = (uint32_t)(mac & 0xFFFFFFFF);
-  Serial.printf("Node boot. ID: %u\n", uniqueNodeId);
+  Serial.printf("Node boot. ID: %u Type: %d\n", uniqueNodeId, DEVICE_TYPE);
 
-  // Load provisioning state from NVS
   prefs.begin(NVS_NAMESPACE, false);
   provisioned = prefs.getBool(NVS_KEY_PROV, false);
   String key = prefs.getString(NVS_KEY_APIKEY, "");
   if (key.length() > 0) {
     strncpy(nodeApiKey, key.c_str(), sizeof(nodeApiKey) - 1);
   }
+  String gid = prefs.getString(NVS_KEY_GATEWAY, "");
+  if (gid.length() > 0) {
+    strncpy(nodeGatewayId, gid.c_str(), sizeof(nodeGatewayId) - 1);
+  }
 
   if (provisioned) {
-    Serial.println("State: PROVISIONED");
+    Serial.printf("State: PROVISIONED (gateway: %s)\n", nodeGatewayId);
   } else {
     Serial.println("State: UNPROVISIONED — broadcasting discovery");
     digitalWrite(LED_BUILTIN, HIGH);
@@ -266,7 +275,26 @@ void loop() {
       msg.header = 0xAA;
       msg.msgType = MSG_TELEMETRY;
       msg.deviceId = uniqueNodeId;
-      msg.value = analogRead(34);
+
+      // Read sensor based on device type
+      switch (DEVICE_TYPE) {
+        case 1: // analog
+          msg.value = analogRead(34);
+          break;
+        case 2: // digital
+          msg.value = digitalRead(34) ? 1 : 0;
+          break;
+        case 3: // relay — report current state
+          msg.value = 0; // relay state tracked externally
+          break;
+        case 4: // IR
+          msg.value = 0; // IR data handled separately
+          break;
+        default:
+          msg.value = analogRead(34);
+          break;
+      }
+
       msg.checksum = calcChecksum((uint8_t*)&msg, sizeof(msg));
 
       sendESPNow((uint8_t*)&msg, sizeof(msg));
@@ -279,11 +307,11 @@ void loop() {
       msg.header = 0xAA;
       msg.msgType = MSG_DISCOVERY;
       msg.deviceId = uniqueNodeId;
-      msg.value = 0;
+      msg.value = DEVICE_TYPE; // carry device type in value field
       msg.checksum = calcChecksum((uint8_t*)&msg, sizeof(msg));
 
       sendESPNow((uint8_t*)&msg, sizeof(msg));
-      Serial.printf("Discovery broadcast: ID %u\n", uniqueNodeId);
+      Serial.printf("Discovery broadcast: ID %u Type %d\n", uniqueNodeId, DEVICE_TYPE);
     }
   }
 }
