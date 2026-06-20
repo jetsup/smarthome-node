@@ -3,6 +3,7 @@
 #include <esp_now.h>
 #include <Preferences.h>
 #include "Config.hpp"
+#include "capabilities.hpp"
 
 struct __attribute__((__packed__)) ESPNowMessage {
   uint8_t header;
@@ -18,6 +19,9 @@ struct __attribute__((__packed__)) ESPNowProvisionMessage {
   uint32_t deviceId;
   char apiKey[33];
   char gatewayId[17];
+  char nodeName[17];
+  uint8_t capCount;
+  CapabilitySlot caps[CAP_MAX_COUNT];
   uint8_t checksum;
 };
 
@@ -28,10 +32,16 @@ Preferences prefs;
 bool provisioned = false;
 char nodeApiKey[33] = {0};
 char nodeGatewayId[17] = {0};
+char nodeName[17] = {0};
+
+uint8_t capCount = 0;
+CapabilitySlot caps[CAP_MAX_COUNT];
+uint16_t pinValues[CAP_MAX_COUNT] = {0};
 
 unsigned long lastReport = 0;
 unsigned long lastDiscovery = 0;
 unsigned long lastMeshFwd = 0;
+unsigned long lastLedToggle = 0;
 
 #define DEDUP_SIZE 16
 uint32_t dedupIds[DEDUP_SIZE];
@@ -60,6 +70,64 @@ uint8_t calcChecksum(const uint8_t* data, int len) {
 
 void sendESPNow(const uint8_t* data, int len) {
   esp_now_send(broadcastMac, data, len);
+}
+
+void handleCommand(uint16_t val) {
+  // Apply command value to all capabilities
+  for (int i = 0; i < capCount; i++) {
+    if (caps[i].type == CAP_ANALOG_OUT) {
+      pinValues[i] = val;
+      ledcWrite(i, val);
+    } else if (caps[i].type == CAP_DIGITAL_OUT || caps[i].type == CAP_RELAY) {
+      uint8_t onOff = val ? HIGH : LOW;
+      digitalWrite(caps[i].pin, onOff);
+      pinValues[i] = onOff;
+    }
+  }
+  digitalWrite(LED_BUILTIN, val ? HIGH : LOW);
+}
+
+void handlePinCommand(uint8_t pin, uint8_t val) {
+  for (int i = 0; i < capCount; i++) {
+    if (caps[i].pin != pin) continue;
+    switch (caps[i].type) {
+      case CAP_ANALOG_OUT:
+        pinValues[i] = val;
+        ledcWrite(i, val);
+        return;
+      case CAP_DIGITAL_OUT:
+      case CAP_RELAY:
+        digitalWrite(caps[i].pin, val ? HIGH : LOW);
+        pinValues[i] = val ? 1 : 0;
+        return;
+      default:
+        return;
+    }
+  }
+}
+
+uint16_t readCapabilityInputs() {
+  uint16_t val = 0;
+  for (int i = 0; i < capCount; i++) {
+    switch (caps[i].type) {
+      case CAP_ANALOG_IN:
+        val = analogRead(caps[i].pin);
+        pinValues[i] = val;
+        break;
+      case CAP_DIGITAL_IN:
+        val = digitalRead(caps[i].pin) ? 1 : 0;
+        pinValues[i] = val;
+        break;
+      case CAP_ANALOG_OUT:
+      case CAP_DIGITAL_OUT:
+      case CAP_RELAY:
+        val = pinValues[i];
+        break;
+      default:
+        break;
+    }
+  }
+  return val;
 }
 
 void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
@@ -99,12 +167,24 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
         prefs.remove(NVS_KEY_PROV);
         prefs.remove(NVS_KEY_APIKEY);
         prefs.remove(NVS_KEY_GATEWAY);
+        prefs.remove(NVS_KEY_NAME);
+        prefs.remove(NVS_KEY_CAPS);
         prefs.end();
         delay(500);
         ESP.restart();
       } else {
-        digitalWrite(LED_BUILTIN, val ? HIGH : LOW);
+        handleCommand(val);
       }
+      break;
+    }
+
+    case MSG_PIN_CMD: {
+      if (devId != 0 && devId != uniqueNodeId) break;
+      if (len < 8) break;
+      uint8_t pin = incomingData[6];
+      uint8_t val = incomingData[7];
+      Serial.printf("PIN_CMD: pin=%u val=%u\n", pin, val);
+      handlePinCommand(pin, val);
       break;
     }
 
@@ -115,7 +195,7 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
         resp.header = 0xAA;
         resp.msgType = MSG_DISCOVERY;
         resp.deviceId = uniqueNodeId;
-        resp.value = DEVICE_TYPE; // carry device type in value field
+        resp.value = DEVICE_TYPE;
         resp.checksum = calcChecksum((uint8_t*)&resp, sizeof(resp));
         sendESPNow((uint8_t*)&resp, sizeof(resp));
         Serial.printf("SCAN_REQ: sent discovery response (myId=%u type=%d)\n", uniqueNodeId, DEVICE_TYPE);
@@ -138,19 +218,27 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
         ESPNowProvisionMessage provMsg;
         memcpy(&provMsg, incomingData, sizeof(ESPNowProvisionMessage));
 
-        Serial.printf("PROVISION: full message, key starts: %.10s, gateway: %.16s\n",
-          provMsg.apiKey, provMsg.gatewayId);
+        Serial.printf("PROVISION: full message, key starts: %.10s, gateway: %.16s, name=%s\n",
+          provMsg.apiKey, provMsg.gatewayId, provMsg.nodeName);
 
         prefs.putBool(NVS_KEY_PROV, true);
         prefs.putString(NVS_KEY_APIKEY, String(provMsg.apiKey));
         prefs.putString(NVS_KEY_GATEWAY, String(provMsg.gatewayId));
+        prefs.putString(NVS_KEY_NAME, String(provMsg.nodeName));
+        prefs.putString(NVS_KEY_CAPS, serializeCaps(provMsg.caps, provMsg.capCount));
         prefs.end();
 
         provisioned = true;
         strncpy(nodeApiKey, provMsg.apiKey, sizeof(nodeApiKey) - 1);
         strncpy(nodeGatewayId, provMsg.gatewayId, sizeof(nodeGatewayId) - 1);
+        strncpy(nodeName, provMsg.nodeName, sizeof(nodeName) - 1);
+        capCount = provMsg.capCount > CAP_MAX_COUNT ? CAP_MAX_COUNT : provMsg.capCount;
+        memcpy(caps, provMsg.caps, capCount * sizeof(CapabilitySlot));
 
-        Serial.printf("PROVISION: saved — API key: %s, gateway: %s\n", nodeApiKey, nodeGatewayId);
+        applyCapPinModes(caps, capCount);
+
+        Serial.printf("PROVISION: saved — API key: %s, gateway: %s, name: %s, caps: %d\n",
+          nodeApiKey, nodeGatewayId, nodeName, capCount);
         Serial.println("PROVISION: rebooting in 500ms");
         delay(500);
         ESP.restart();
@@ -159,11 +247,15 @@ void onDataRecv(const uint8_t* mac_addr, const uint8_t* incomingData, int len) {
         prefs.putBool(NVS_KEY_PROV, true);
         prefs.putString(NVS_KEY_APIKEY, "node_provisioned");
         prefs.putString(NVS_KEY_GATEWAY, "unknown");
+        prefs.putString(NVS_KEY_NAME, "");
+        prefs.putString(NVS_KEY_CAPS, "");
         prefs.end();
 
         provisioned = true;
         strcpy(nodeApiKey, "node_provisioned");
         strcpy(nodeGatewayId, "unknown");
+        nodeName[0] = '\0';
+        capCount = 0;
 
         Serial.println("PROVISION: provisioned with defaults, rebooting");
         delay(500);
@@ -198,6 +290,8 @@ void checkResetPin() {
       prefs.remove(NVS_KEY_PROV);
       prefs.remove(NVS_KEY_APIKEY);
       prefs.remove(NVS_KEY_GATEWAY);
+      prefs.remove(NVS_KEY_NAME);
+      prefs.remove(NVS_KEY_CAPS);
       prefs.end();
       delay(500);
       ESP.restart();
@@ -205,6 +299,11 @@ void checkResetPin() {
   } else {
     pressStart = 0;
   }
+}
+
+void parseAndApplyCaps(const String& capsStr) {
+  capCount = deserializeCaps(caps, capsStr);
+  applyCapPinModes(caps, capCount);
 }
 
 void setup() {
@@ -228,9 +327,27 @@ void setup() {
   if (gid.length() > 0) {
     strncpy(nodeGatewayId, gid.c_str(), sizeof(nodeGatewayId) - 1);
   }
+  String name = prefs.getString(NVS_KEY_NAME, "");
+  if (name.length() > 0) {
+    strncpy(nodeName, name.c_str(), sizeof(nodeName) - 1);
+  }
+  String capsStr = prefs.getString(NVS_KEY_CAPS, "");
+  if (capsStr.length() > 0) {
+    parseAndApplyCaps(capsStr);
+  }
+
+  // Read analog input pins on boot so reported values reflect actual pin state
+  for (int i = 0; i < capCount; i++) {
+    if (caps[i].type == CAP_ANALOG_IN) {
+      pinValues[i] = analogRead(caps[i].pin);
+    } else if (caps[i].type == CAP_DIGITAL_IN) {
+      pinValues[i] = digitalRead(caps[i].pin) ? 1 : 0;
+    }
+  }
 
   if (provisioned) {
-    Serial.printf("State: PROVISIONED (gateway: %s)\n", nodeGatewayId);
+    Serial.printf("State: PROVISIONED (gateway: %s, name: %s, caps: %d)\n",
+      nodeGatewayId, nodeName, capCount);
   } else {
     Serial.println("State: UNPROVISIONED — broadcasting discovery");
     digitalWrite(LED_BUILTIN, HIGH);
@@ -243,7 +360,16 @@ void setup() {
   }
 
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < WIFI_TIMEOUT_MS) {
+    delay(100);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi connected on channel %d\n", WiFi.channel());
+  } else {
+    Serial.println("WiFi not available — ESP-NOW on default channel");
+  }
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
@@ -276,30 +402,19 @@ void loop() {
       msg.msgType = MSG_TELEMETRY;
       msg.deviceId = uniqueNodeId;
 
-      // Read sensor based on device type
-      switch (DEVICE_TYPE) {
-        case 1: // analog
-          msg.value = analogRead(34);
-          break;
-        case 2: // digital
-          msg.value = digitalRead(34) ? 1 : 0;
-          break;
-        case 3: // relay — report current state
-          msg.value = 0; // relay state tracked externally
-          break;
-        case 4: // IR
-          msg.value = 0; // IR data handled separately
-          break;
-        default:
-          msg.value = analogRead(34);
-          break;
-      }
+      msg.value = readCapabilityInputs();
 
       msg.checksum = calcChecksum((uint8_t*)&msg, sizeof(msg));
 
       sendESPNow((uint8_t*)&msg, sizeof(msg));
     }
   } else {
+    // Blink LED every 100ms during discovery mode
+    if (now - lastLedToggle >= 100) {
+      lastLedToggle = now;
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    }
+
     if (now - lastDiscovery > DISCOVERY_INTERVAL_MS) {
       lastDiscovery = now;
 
@@ -307,7 +422,7 @@ void loop() {
       msg.header = 0xAA;
       msg.msgType = MSG_DISCOVERY;
       msg.deviceId = uniqueNodeId;
-      msg.value = DEVICE_TYPE; // carry device type in value field
+      msg.value = DEVICE_TYPE;
       msg.checksum = calcChecksum((uint8_t*)&msg, sizeof(msg));
 
       sendESPNow((uint8_t*)&msg, sizeof(msg));
