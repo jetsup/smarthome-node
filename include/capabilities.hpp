@@ -125,6 +125,13 @@ inline void applyCapPinModes(const CapabilitySlot* caps, uint8_t count) {
         break;
       case CAP_ANALOG_IN:
         pinMode(caps[i].pin, INPUT);
+        // ADC2 pins (GPIO 0,2,4,12-15,25-27) conflict with Wi-Fi on ESP32.
+        // analogRead() will return ESP_ERR_TIMEOUT on these pins when Wi-Fi is active.
+        if (caps[i].pin == 0 || caps[i].pin == 2 || caps[i].pin == 4 ||
+            (caps[i].pin >= 12 && caps[i].pin <= 15) ||
+            caps[i].pin == 25 || caps[i].pin == 26 || caps[i].pin == 27) {
+          Serial.printf("Warning: GPIO %d is ADC2 — will fail with Wi-Fi enabled\n", caps[i].pin);
+        }
         break;
       default:
         // I2C, UART, IR handled externally
